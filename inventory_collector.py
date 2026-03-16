@@ -554,11 +554,12 @@ class SqlAnalyticsCollector(BaseCollector):
         self._save("warehouses.json", detailed_wh)
         queries = self._safe_list(self.client.queries.list, label="queries.list")
         # Enrich with full query details (SQL text, visualizations, schedule)
+        # SDK versions differ: newer QueriesAPI.get(id=...) vs legacy QueriesLegacyAPI.get(query_id=...)
         detailed_queries = []
         for q in queries:
             qid = q.get("id")
             if qid:
-                d = self._safe_get(self.client.queries.get, id=qid, label=f"queries.get({qid})")
+                d = self._safe_get(self.client.queries.get, qid, label=f"queries.get({qid})")
                 detailed_queries.append(d or q)
             else:
                 detailed_queries.append(q)
