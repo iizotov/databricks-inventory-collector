@@ -29,6 +29,11 @@
 # MAGIC ### Resume
 # MAGIC Writes `.checkpoint.json`. If interrupted, re-run and completed collectors are skipped.
 # MAGIC
+# MAGIC ### PII Scrubbing
+# MAGIC PII scrubbing is **enabled by default**. Emails, usernames, token hashes, IP addresses, and
+# MAGIC Databricks API tokens are redacted from all output files. Set **Scrub PII** to `no` to disable.
+# MAGIC Uses regex + field-name matching (zero extra dependencies).
+# MAGIC
 # MAGIC ### Disclaimer
 # MAGIC This software is provided "as is", without warranty of any kind, express or implied. Use at your
 # MAGIC own risk. This project is **not affiliated with, endorsed by, or associated with Amazon Web Services
@@ -59,6 +64,7 @@ dbutils.widgets.multiselect(
      "sql_analytics", "ml", "security", "serving", "sharing", "quality", "usage"],
     "Collector groups"
 )
+dbutils.widgets.dropdown("scrub_pii", "yes", ["yes", "no"], "Scrub PII from output")
 
 # COMMAND ----------
 
@@ -68,6 +74,7 @@ dbutils.widgets.multiselect(
 
 import json
 import os
+import re
 import time
 import logging
 import hashlib
@@ -95,6 +102,7 @@ class Settings:
     history_days: int
     max_workers: int
     enabled_collectors: list
+    scrub_pii: bool = False
 
 def _parse_widgets():
     raw = dbutils.widgets.get("collectors").split(",")
@@ -104,6 +112,7 @@ def _parse_widgets():
         history_days=int(dbutils.widgets.get("history_days")),
         max_workers=int(dbutils.widgets.get("max_workers")),
         enabled_collectors=enabled,
+        scrub_pii=dbutils.widgets.get("scrub_pii").strip().lower() == "yes",
     )
 
 settings = _parse_widgets()
@@ -111,6 +120,54 @@ print(f"Output:     {settings.output_dir}")
 print(f"History:    {settings.history_days} days")
 print(f"Workers:    {settings.max_workers}")
 print(f"Collectors: {', '.join(settings.enabled_collectors)}")
+print(f"Scrub PII:  {settings.scrub_pii}")
+
+# ---------------------------------------------------------------------------
+# PII scrubber — zero external dependencies, regex + field-name based
+# ---------------------------------------------------------------------------
+
+# Keys whose values should always be fully redacted
+_SCRUB_KEYS = frozenset({
+    "userName", "user_name", "email",
+    "created_by", "updated_by", "creator_name", "created_by_username",
+    "owner",
+    "token_id",
+})
+
+# Regex patterns applied to every string value
+_SCRUB_PATTERNS = [
+    # Databricks PAT tokens (dapi + 32+ hex chars)
+    (re.compile(r"dapi[a-f0-9]{32,}"),                        "{{DATABRICKS_TOKEN}}"),
+    # Email addresses
+    (re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"), "{{EMAIL}}"),
+    # Token hashes / long hex secrets (standalone 64-char hex)
+    (re.compile(r"(?<![a-f0-9/])[a-f0-9]{64}(?![a-f0-9])"),  "{{TOKEN_HASH}}"),
+    # IPv4 addresses (but not version-like strings e.g. "1.2.3")
+    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),             "{{IP_ADDRESS}}"),
+]
+
+
+def _scrub_value(value):
+    """Apply regex patterns to a single string value."""
+    for pattern, replacement in _SCRUB_PATTERNS:
+        value = pattern.sub(replacement, value)
+    return value
+
+
+def scrub_pii(obj, _parent_key=None):
+    """Recursively scrub PII from a data structure (dict/list/str).
+    Returns a new object with sensitive values redacted."""
+    if isinstance(obj, dict):
+        return {k: scrub_pii(v, _parent_key=k) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [scrub_pii(item, _parent_key=_parent_key) for item in obj]
+    if isinstance(obj, str):
+        # Full redaction for known-sensitive keys
+        if _parent_key in _SCRUB_KEYS:
+            return "{{REDACTED}}"
+        # Regex-based scrub for all other string values
+        return _scrub_value(obj)
+    return obj
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -152,8 +209,10 @@ def to_dict(obj):
 def to_dict_list(iterator):
     return [to_dict(item) for item in iterator]
 
-def atomic_write(path, data):
+def atomic_write(path, data, scrub=False):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if scrub:
+        data = scrub_pii(data)
     fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
@@ -205,7 +264,7 @@ class BaseCollector(ABC):
 
     def _save(self, filename, data):
         path = os.path.join(self.output_dir, filename)
-        atomic_write(path, data)
+        atomic_write(path, data, scrub=self.settings.scrub_pii)
         return path
 
     def _record_error(self, context, error):
